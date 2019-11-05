@@ -1,0 +1,340 @@
+#!/bin/sh
+
+# A toolchain on steroïds ! (tm)
+#
+# This tool is a layer over a micropython toolchain. It gives a better cli syntax
+# for performing operations on the MCU and easier scripting/automation.
+
+# TODO: make python script using rshell (and esptool) module instead of bash script,
+#       except for 'install' and 'toolchain', where it is needed.
+#
+#       add a python code minifier to remove comments at during build.
+#
+# TODO: unify commands 'deps' and 'build' by:
+#       copying workspace to ./build (rename DEPS_SOURCE -> BUILD_PATH),
+#       use pyminifier to strip comments and docstrings from ./build/*/*.py,
+#       as possible, copy only files that diffed since last *successful* uplod
+#       (wait for pythonification of script)
+#
+# FIXME: find a way to get permanent/reliable FIRMWARE_URL to latest firmware .bin
+#        note that, from now on, there are variants of the firmware
+#
+# FIXME: $(test) commands should be replaced with [ condition ] structures.
+#
+# FIXME: this tool could be named 'itiot' or 'toolchain', instead of 'mcu'
+#
+# FIXME: when an unknown command is given, the script exits silently with code 0.
+#
+# TODO: Web-REPL setup handler, eg. ./mcu webrepl ?
+#       see http://docs.micropython.org/en/v1.10/esp32/quickref.html#webrepl-web-browser-interactive-prompt
+
+# Import config
+CONFIG=${CONFIG:-./config}  # FIXME: rename file to itiot.conf
+[ -f $CONFIG ] && . $CONFIG
+
+# Default config (preserving existing values)
+DEVICE=${DEVICE:-/dev/tty.usbserial-0001}
+FIRMWARE_URL=${FIRMWARE_URL:-http://micropython.org/resources/firmware/esp32-idf3-20190529-v1.11.bin}
+FIRMWARE_TMP=${FIRMWARE_TMP:-/tmp/firmware.bin}
+BUILD_PATH=${BUILD_PATH:-./build}
+DEPS_SOURCE=${DEPS_SOURCE:-$BUILD_PATH/lib}  # FIXME
+FLASH_PATH=${FLASH_PATH:-/pyboard}
+# TODO: workspace handling
+# WORKSPACE=./  # workspace root directory, override this value to switch workspace
+
+# Constants
+DEFAULT_SOURCE=examples/example.py
+DEFAULT_TARGET=main.py
+HOMEPAGE=https://github.com/damiencorpataux/itiot
+FEEDBACK=https://github.com/damiencorpataux/itiot/issues
+
+function header {
+    echo
+    echo
+    echo "ITIOT MCU management tool - $HOMEPAGE"
+    echo
+}
+
+function error {
+    echo
+    echo "Error:"
+    echo
+    echo "    $1"
+    echo
+    echo
+    echo "Report and feedback welcome at $FEEDBACK"
+    echo
+    exit 1
+}
+
+# Toolchain versions
+set -o pipefail
+MICROPYTHON=$(micropython -c "import sys; print(sys.version_info)" 2>/dev/null || echo '-')
+ESPTOOL=$(esptool.py version 2>/dev/null | head -1 || echo '-')
+RSHELL=$(rshell --version 2>/dev/null || echo '-')
+PICOCOM=$(picocom --help 2>/dev/null | head -1 || echo '-')
+
+# Validation and help message
+SOURCED=$(test "${BASH_SOURCE[0]}" != "${0}" && echo 1)
+PIPED=$(test "${BASH_SOURCE[0]}" == "" && echo 1)
+
+if [ $SOURCED ] || [ $(test "$1" == "-h" || test -z "$1" && echo 1) ] && [ ! $PIPED ]
+then
+    SCRIPT=$(test $SOURCED && echo ./$BASH_SOURCE || echo $0)
+    header
+    echo "Usage:
+      $SCRIPT [<command>] [<arg>]
+
+  Commands:
+      install             - Install itself here ($(pwd))
+      toolchain           - Install itiot toolchain software on this computer (3rd-party open-source, see below)
+
+      drop [file] [dest]  - Batch commands flash, deps, build & copy, for 1-step MCU setup
+      test [file] [dest]  - Batch commands copy & terminal, usually for dev purpose
+
+      flash               - Download and flash micropython firmware to MCU, erasing
+      deps                - Build and copy itiot dependencies to MCU (build in $DEPS_SOURCE, copy to $FLASH_PATH)
+      build [raw]         - Copy itiot library to MCU (copy to $FLASH_PATH)
+                            if raw, do not minify
+      copy [file] [dest]  - Copy file or directory to MCU
+
+      terminal            - Open a terminal to MCU (press ^a then ^x to exit)
+      shell [cmd]         - Open shell to MCU, optionally executing cmd (press ^d to exit)
+      ls [file]           - List files on MCU flash, alias of command 'shell ls -la $FLASH_PATH' (press ^d to abort)
+                            when file is specified, + will be replaced with FLASH_PATH ($FLASH_PATH)
+
+      lint [file]         - Lint file (default: $DEFAULT_SOURCE)
+                            for now, it only executes the given file with micropython (#todo: make useful linting)
+
+  Arguments:
+      [file] defaults to: $DEFAULT_SOURCE
+      [dest] defaults to: $DEFAULT_TARGET
+
+  Config:
+      - CONFIG=$CONFIG
+      - DEVICE=$DEVICE
+      - FIRMWARE_URL=$FIRMWARE_URL
+      - DEPS_SOURCE=$DEPS_SOURCE
+      - FLASH_PATH=$FLASH_PATH
+      + to override configuration parameters, type for example 'DEVICE=/dev/usb0 $SCRIPT'
+      + or specify a config file with CONFIG env variable
+
+  Toolchain:
+      - micropython: $MICROPYTHON
+      - esptool: $ESPTOOL
+      - rshell: $RSHELL
+      - picocom: $PICOCOM
+
+  USB ports:
+$(rshell --list | tr -d '\r' | sed 's#\(.*\)\(/dev/.*\)$#\2 <-- \1#' | sed 's/^/      - /' | cut -c1-100 | sed 's/$/.../')
+"
+    test $SOURCED && return
+    test $HELP && exit 0
+fi
+
+# set -e # FIXME: something fails in CLI parsinig
+
+# CLI commands and arguments
+INSTALL=$(test "$1" == "install" && echo 1)
+TOOLCHAIN=$(test "$1" == "toolchain" && echo 1)
+LINT=$(test "$1" == "lint" && echo 1)
+TEST=$(test "$1" == "test" && echo 1)
+DROP=$(test "$1" == "drop" && echo 1)
+FLASH=$(test "$1" == "flash" || test $DROP && echo 1)
+DEPS=$(test "$1" == "deps" || test $DROP && echo 1)
+BUILD=$(test "$1" == "build" || test $DROP && echo 1)
+COPY=$(test "$1" == "copy" || test $DROP || test $TEST && echo 1)
+TERMINAL=$(test "$1" == "terminal" || test "$1" == "term" || test $TEST && echo 1)
+SHELL=$(test "$1" == "shell" || test "$1" == "sh" && echo 1)
+LS=$(test "$1" == "ls" && echo 1)
+
+set -e
+echo
+
+if [ $PIPED ]
+then
+    # echo "* Do you want to install itiot toolchain on this computer ?"
+    # read -n3 -p "Type yes to continue: " YES
+    # echo ""
+    # test "$YES" != "yes" && exit 1
+    INSTALL=1
+    TOOLCHAIN=1
+    header
+fi
+
+# Commands logic
+if [ $TOOLCHAIN ]
+then
+    echo "* Installing itiot toolchain on this computer..."
+    echo
+    if [ "$(uname)" == "Darwin" ]
+    then
+        echo "+ Checking brew..."
+        brew --version || /usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
+        brew install git micropython esptool picocom
+        #brew install git micropython picocom
+        echo
+        echo "+ Checking pip3..."
+        pip3 --version || brew install pip3
+        pip3 install rshell argh
+        #pip3 install esptool rshell pyminifier argh # install as much as possible with pip3, which is cross-plateform
+    elif [ "$(uname)" == "Linux" ]
+    then
+        echo "+ APT installation is not tested yet, feedback welcome at $FEEDBACK"
+        echo
+        # FIXME: to be tested
+        apt install -y micropython esptool rshell picocom
+    else
+        echo "ERROR: The operating system installed on this machine is not supported"
+        exit 1
+    fi
+fi
+
+if [ $INSTALL ]
+then
+    if [ -f ./mcu ] || [ -d ./itiot ] || [ -d ../itiot ]
+    then
+        error "itiot seems already installed here, aborting"
+    fi
+
+    echo "* Installing itiot environment in $(pwd)/itiot..."
+    echo
+    # FIXME: curl http://...zip instead of git clone ?
+    rm -rf itiot
+    # FIXME: git@github.com:damiencorpataux/itiot.git
+    git clone --single-branch --branch dev git@bitbucket.org:damiencorpataux/itiot.git
+    echo
+    echo "+ Installation successful !"
+    echo
+    echo "+ First, type 'cd itiot' and './mcu' for information,"
+    echo "+ try './mcu drop' to flash the basic example (push the BOOT button)"
+    echo "+ and './mcu term' to connect to your MCU"
+    echo
+fi
+
+if [ $FLASH ]
+then
+    echo "* Flasking micropython firmward to MCU..."
+    echo
+    echo "+     This will erase and flash MCU !"
+    echo "+     File to be flashed: $FIRMWARE_URL"
+    echo "+     Press the 'boot' button on your MCU to continue"
+    echo
+    echo "+ Downloading firmware in $FIRMWARE_TMP from $FIRMWARE_URL"
+    curl --progress-bar $FIRMWARE_URL > $FIRMWARE_TMP
+    echo
+    echo "+ Flashing firmware to MCU..."
+    esptool.py --chip esp32 erase_flash
+    esptool.py --chip esp32 write_flash -z 0x1000 $FIRMWARE_TMP
+    rm $FIRMWARE_TMP
+fi
+
+if [ $DEPS ]
+then
+    REQUIREMENTS=requirements.micropython.txt
+    echo "* Uploading dependencies to MCU..."
+    echo
+    echo "+ Building dependencies from $REQUIREMENTS in $DEPS_SOURCE..."
+    micropython -m upip install -p $DEPS_SOURCE -r $REQUIREMENTS
+    SIZE=$(du -sh $DEPS_SOURCE | xargs | cut -d' ' -f1)B
+    echo
+    echo "+ Uploading dependencies to MCU $FLASH_PATH ($SIZE)..."
+    # FIXME: should be factorized with command copy
+    # FIXME: there should be only COPY
+    # rshell  --timing --port $DEVICE mkdir $FLASH_PATH
+    rshell  --timing --port $DEVICE cp -r $DEPS_SOURCE $FLASH_PATH
+    echo
+fi
+
+if [ $BUILD ]
+then
+    # FIXME: there should be only COPY
+    # TODO: make this generic to any project PATH
+    BUILD_SOURCE=./itiot
+    BUILD_PRODUCT=$BUILD_PATH/local
+    SIZE_SOURCE=$(du -sh $BUILD_SOURCE | xargs | cut -d' ' -f1)
+    echo "* Uploading a build of local library to MCU $DEVICE"
+    echo "+ Building to $BUILD_PRODUCT"
+    rm -rf $BUILD_PRODUCT
+    find $BUILD_SOURCE -type d -exec mkdir -p $BUILD_PRODUCT/{} \;
+    for file in $(find $BUILD_SOURCE -iname *.py)
+    do
+        DESTINATION=$BUILD_PRODUCT/$file
+        cp $file $DESTINATION
+        # test "$2" != "raw" && python3 -m pyminifier.pyminifier $DESTINATION > $DESTINATION
+    done
+    SIZE_PRODUCT=$(du -sh $BUILD_PRODUCT | xargs | cut -d' ' -f1)
+    echo "+ Minified $SIZE_SOURCE to $SIZE_PRODUCT"
+    echo
+
+    echo "+ Uploading $BUILD_SOURCE to MCU..."
+    echo
+    rshell  --timing --port $DEVICE cp -r $BUILD_PRODUCT/* $FLASH_PATH/.
+    echo
+fi
+
+if [ $COPY ]
+then
+    COPY_SOURCE=$(test "$2" != "" && echo $2 || echo $DEFAULT_SOURCE)
+    COPY_TARGET=$(test "$3" != "" && echo $3 || echo $DEFAULT_TARGET)
+    SIZE=$(du -sh $COPY_SOURCE | xargs | cut -d' ' -f1)B
+    if [ -d $COPY_SOURCE ]
+    then
+        echo "* Uploading $SIZE: $COPY_SOURCE to MCU $FLASH_PATH ..."
+        echo
+        # FIXME: mkdir ?
+        rshell  --timing --port $DEVICE cp -r $COPY_SOURCE $FLASH_PATH
+    else
+        TARGET=$FLASH_PATH/$COPY_TARGET
+        echo "* Uploading $SIZE: $COPY_SOURCE to MCU $TARGET..."
+        echo
+        rshell  --timing --port $DEVICE cp $COPY_SOURCE $TARGET
+    fi
+    echo
+    echo
+    echo "You may need to press the EN or RESET button on your MCU,"
+    echo "or type: ./mcu terminal"
+fi
+
+if [ $SHELL ]
+then
+    FLASH_PATH_ESCAPED=$(echo $FLASH_PATH | sed 's/\//\\\//g')  # replace / with \/
+    SHELL_COMMAND=${@:2}
+    SHELL_COMMAND=$(echo $SHELL_COMMAND | sed "s/\+/$FLASH_PATH_ESCAPED/")
+    if [ "$SHELL_COMMAND" ]
+    then
+        echo "* Connecting to MCU shell for $SHELL_COMMAND..."
+        rshell --quiet --port $DEVICE $SHELL_COMMAND
+    else
+        echo "* Connecting to MCU shell at $DEVICE..."
+        echo "+ Try 'cd $FLASH_PATH' or 'ls -l $FLASH_PATH'"
+        rshell --port $DEVICE
+    fi
+fi
+
+if [ $LS ]
+then
+    LS_FILE=$FLASH_PATH/$2
+    echo "* Listing $LS_FILE on MCU..."
+    rshell --quiet --port $DEVICE ls -la $LS_FILE
+fi
+
+if [ $TERMINAL ]
+then
+    echo "* Connecting to MCU terminal at $DEVICE..."
+    echo
+    picocom --quiet --baud 115200 $DEVICE
+fi
+
+if [ $LINT ]
+then
+    # TODO: find all *.py files in directory, except venv and build
+    # and grep them for syntax error (the only thing we can lint for now)
+    # and display only occurences of syntax error
+    LINT_FILE=$(test "$2" != "" && echo $2 || echo $DEFAULT_SOURCE)
+    echo "* Running $LINT_FILE with micropython $MICROPYTHON..."
+    echo
+    micropython $LINT_FILE || true
+fi
+
+echo
