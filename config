@@ -1,0 +1,33 @@
+#
+# You can override configuration parameters here.
+#
+# Uncomment a line and edit the value (my custom value), for example:
+# DEVICE=${DEVICE:-/dev/usb1}
+#
+# and run ./mcu again.
+#
+
+# The USB port device connected to the MCU, usually looks like '/dev/usb'
+# Type './mcu' and look at the section 'USB Ports'
+#
+# DEVICE=${DEVICE:-my custom value}
+
+DEVICE=${DEVICE:-/dev/tty.usbserial-0001}
+
+# The baudrate flashing and terminal/rshell.
+# BAUD=${BAUD:-115200}
+# BAUD=${BAUD:-115200}
+
+# The URL of the firmware to be downloaded and flashed to MCU
+# Micropython download page: http://micropython.org/download
+#
+# FIRMWARE_URL=${FIRMWARE_URL:-my custom value}
+
+# Local (computer) path of dependencies to be copied to MCU (for rshell)
+#
+# DEPS_SOURCE=${DEPS_SOURCE:-my custom value}
+
+# MCU flash path for (for rshell)
+# From https://github.com/dhylands/rshell#rshell: "When using the commands, the /flash directory, and the /sdcard directory (if an sdcard is inserted) are considered to be on the pyboard, and all other directories are considered to be on the host. For an ESP based board you can only reference its directory by using the board name e.g. /pyboard etc.."
+#
+# FLASH_PATH=${FLASH_PATH:-my custom value}
