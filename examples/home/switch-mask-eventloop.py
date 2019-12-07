@@ -3,13 +3,13 @@ import machine
 import dht
 import uasyncio
 import json
+import time
 
 def cache(timeout=2):
     """
     Minimalistic cache decorator.
     """
     # from https://stackoverflow.com/a/53918439/1300775
-    import time
     cache = dict()
     def wrapper(f):
         def wrapped(*args, **kwargs):
@@ -65,8 +65,9 @@ pins = {
     'temperature': machine.ADC(machine.Pin(36)),
     'pir': machine.Pin(35, machine.Pin.IN),
     'dht': dht.DHT22(machine.Pin(4)),
-    'switch': [machine.Signal(machine.Pin(n, machine.Pin.OUT), invert=True)
-               for n in (5, 18, 19)]}
+    'switch': [machine.Signal(machine.Pin(n, machine.Pin.OUT), invert=True) for n in (5, 18, 19)]
+             +[machine.Signal(machine.Pin(21, machine.Pin.OUT, machine.Pin.PULL_DOWN), invert=False)],
+    'touch': [machine.TouchPad(machine.Pin(n)) for n in (13, 12, 14)]}
 pins['smoke'].atten(machine.ADC.ATTN_0DB)  # https://docs.micropython.org/en/latest/esp32/quickref.html#ADC.atten
 pins['temperature'].atten(machine.ADC.ATTN_11DB)  # https://docs.micropython.org/en/latest/esp32/quickref.html#ADC.atten
 
@@ -133,21 +134,60 @@ def set_switch(id):
     pin.value(True if value.lower()=='on' else False)
     return get_switch(id)
 
-import time
-class Presence(object):
-    def __init__(self, timeout=60):
-        self.last_detection = None
-        self.timeout = timeout
-    def update(value):
-        if value:
-            self.last_detection = time.time()
-    def sombody(self):
-        # FIXME: time.time() will cycle, handle this
-        return time.time() - self.last_detection < timeout
+# class Presence(object):
+#     def __init__(self, timeout=60):
+#         self.last_detection = None
+#         self.timeout = timeout
+#     def update(value):
+#         if value:
+#             self.last_detection = time.time()
+#     def sombody(self):
+#         # FIXME: time.time() will cycle, handle this
+#         return time.time() - self.last_detection < timeout
+
+# class TouchDim(object):
+#     def __init__(self, pin):
+#         self.pin = pin
+#     def loop(self):
+#         pass
+
+async def network_handler():
+    ip = '192.168.0.254'
+    ssid = 'Wifi "Bel-Air"'
+    psk = 'Corpataux39'
+    import network
+    # FIXME: should not block to let other tasks run while connecting to wifi
+    nic = network.WLAN(network.STA_IF)
+    nic.active(True)
+    nic.connect(ssid, psk)
+    while not nic.isconnected():
+        print('Waiting for network on', nic)
+        await uasyncio.sleep(1)
+    if ip:
+        nic.ifconfig([ip] + list(nic.ifconfig()[1:]))
+    print('Network connected:', nic.ifconfig())
+    await uasyncio.start_server(http.Asyncio(app).serve, '0.0.0.0', 80)
 
 @average()
 def presence():
     return pins['pir'].value()
+
+touch_handler_state = {}
+async def touch_handler():
+    threshold = 500
+    timeout = 1000
+    while True:
+        for i, touch in enumerate(pins['touch']):
+            reading = touch.read()
+            touched = touch_handler_state.get(i, -float('inf'))
+            age = time.ticks_ms() - touched
+            if reading < threshold and age > timeout or age < 0:  # age < 0 when time.ticks_ms() value cycles
+                touch_handler_state[i] = time.ticks_ms()
+                switch = pins['switch'][i]
+                print('Touched %s %s reading=%s<%s age=%sms -> toggling switch %s %s' %(
+                    i, touch, reading, threshold, age, i, switch))
+                switch.value(not switch.value())
+        await uasyncio.sleep(5/100)
 
 async def presence_handler():
     while True:
@@ -160,20 +200,16 @@ async def presence_handler():
 async def smoke_handler():
     while True:
         reading = smoke()
-        danger = reading > 0.5
+        danger = reading > 0.7
         print('Smoke', reading, danger)
         pins['switch'][0].value(danger)
         await uasyncio.sleep(1)
-
-async def network_handler():
-    # FIXME: should not block to let other tasks run while connecting to wifi
-    network.Wifi().connect('Wifi "Bel-Air"', 'Corpataux39', ip='192.168.0.254')
-    await uasyncio.start_server(http.Asyncio(app).serve, '0.0.0.0', 80)
 
 for switch in pins['switch']:
     switch.off()
 try:
     loop = uasyncio.get_event_loop()
+    loop.create_task(touch_handler())
     loop.create_task(presence_handler())
     loop.create_task(smoke_handler())
     loop.create_task(network_handler())
