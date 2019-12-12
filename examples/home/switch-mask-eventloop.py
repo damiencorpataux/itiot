@@ -60,33 +60,142 @@ class average(object):
             return sum(self.history) / len(self.history)
         return wrapped
 
-class Presence(object):
-    def __init__(self, pin:machine.Pin, timeout=180):
+class Indicator(object):
+
+    def __init__(self, pin:int, invert=False):
+        self.invert = invert
         self.pin = pin
+        self.pwm = machine.PWM(machine.Pin(pin))
+        self.pwm.init()
+
+    @property
+    def brightness(self):
+        duty = self.pwm.duty()
+        return (1023-duty if self.invert else duty) / 1023
+
+    def toggle(self):
+        self.to(0 if self.brightness else 1)
+
+    def to(self, brightness):
+        """
+        Set indicator to given brightness. Valid values are 0..1, True and False.
+        """
+        brightness = max(0, min({False: 0, True: 1}.get(brightness, brightness), 1))
+        duty = round((brightness if not self.invert else 1-brightness) * 1023)
+        if True: #duty != self.pwm.duty():
+            log.debug('Indicator pin=%s to brightness=%s duty=%s' % (self.pin, brightness, duty))
+            self.pwm.duty(duty)
+
+    def transition(self, *args, **kwargs):
+        uasyncio.get_event_loop().run_until_complete(self.atransition(*args, **kwargs))
+
+    async def atransition(self, brightness, length=1):
+        # FIXME: witl fail on racing conditions: implement a queue
+        resolution = 5/100  # seconds
+        delta = brightness - self.brightness
+        steps = round(length/resolution)
+        step = delta / steps
+        print('Transition', resolution, delta, steps, step)
+        for i in range(steps):
+            print(self.brightness, step, '=', self.brightness + step)
+            self.to(self.brightness + step)
+            await uasyncio.sleep(resolution)
+        self.to(brightness)
+
+    def pulse(self, *args, **kwargs):
+        uasyncio.get_event_loop().run_until_complete(self.apulse(*args, **kwargs))
+
+    async def apulse(self, times=1, length=2/100, period=3/10):
+        # FIXME: witl fail on racing conditions: implement a queue
+        for i in range(times):
+            self.toggle()
+            await uasyncio.sleep(length)
+            self.toggle()
+            await uasyncio.sleep(period-length)
+
+class IndicatorRgb(object):
+    def __init__(self, r:int, g:int, b:int, invert=False):
+        import collections
+        self.colors = collections.OrderedDict((
+            ('r', Indicator(r, invert)),
+            ('g', Indicator(g, invert)),
+            ('b', Indicator(b, invert))))
+
+    def get(self, color):
+        return self.colors[color]
+
+    def toggle(self, colors='rgb'):
+        for color in colors:
+            self.get(color).toggle()
+
+    def to(self, **colors):
+        for color, brightness in colors.items():
+            self.colors[color].to(brightness)
+
+    def pulse(self, colors='rgb', *args, **kwargs):
+        # loop = uasyncio.get_event_loop()
+        # for color in colors:
+        #     loop.create_task(self.get(color).apulse(*args, **kwargs))
+        # loop.run_forever()
+        uasyncio.get_event_loop().run_until_complete(self.apulse(colors, *args, **kwargs))
+
+    async def apulse(self, colors='rgb', *args, **kwargs):
+        loop = uasyncio.get_event_loop()
+        for color in colors:
+            loop.create_task(self.get(color).apulse(*args, **kwargs))
+
+class Presence(object):
+    def __init__(self, pin:int, timeout=180):
+        self.pin = machine.Pin(pin, machine.Pin.IN)
         self.timeout = timeout * 1000
         self.poll = 3/10
         self.reading = None
         self.last = None
 
     @property
+    def delta(self):
+        return time.ticks_diff(time.ticks_ms(), self.last)
+
+    @property
     def detected(self):
-        delta = time.ticks_diff(time.ticks_ms(), self.last)
-        detected = delta < self.timeout and self.last is not None
-        log.debug('Presence delta=%s detected=%s reading=%s' % (delta, detected, self.reading))
+        detected = self.delta < self.timeout and self.last is not None
         return detected
+
+    def step(self):
+        last_reading = self.reading
+        last_detected = self.detected
+        self.reading = self.pin.value()
+        # log.debug('Presence reading: delta=%s detected=%s reading=%s' % (self.delta, detected, self.reading))
+        if self.reading:
+            self.last = time.ticks_ms()
+        if last_reading != self.reading:
+            log.info('Presence sensor changed: from %s to %s' % (last_reading, self.reading))
+        if last_detected != self.detected:
+            log.info('Presence state changed: from %s to %s' % (last_detected, self.detected))
 
     async def run(self):
         while True:
-            self.reading = self.pin.value()
-            if self.reading:
-                self.last = time.ticks_ms()
+            self.step()
             await uasyncio.sleep(self.poll)
 
-class TouchSwitch(object):
+class Switch(object):
+    def __init__(self):
+        self.values = (False, True)
+        self.state = self.values[0]
 
-    def __init__(self, touch:machine.TouchPad, switch:machine.Pin):
-        self.touch = touch
-        self.switch = switch
+    def toggle(self):
+        next = (self.values.index(self.state) + 1) % len(self.values)
+        self.state = self.values[next]
+
+    async def run(self):
+        pass
+
+class TouchSwitch(Switch):
+
+    def __init__(self, pin:int):
+        super().__init__()
+        self.pin = pin
+        self.touch = machine.TouchPad(machine.Pin(pin))
         self.last_touched = 0
         self.threshold = 500
         self.debounce = 3/10
@@ -97,42 +206,99 @@ class TouchSwitch(object):
             reading = self.touch.read()
             idle = time.ticks_diff(time.ticks_ms(), self.last_touched)
             if reading < self.threshold and (idle > self.debounce * 1000 or idle < 0):
-                print('Touched %s reading=%s<%s idle=%sms -> toggling switch %s' %(self.touch, reading, self.threshold, idle, self.switch))
+                self.toggle()
+                log.info('%s touched %s pin=%s state=%s reading=%s<%s idle=%sms' %(self, self.touch, self.pin, self.state, reading, self.threshold, idle))
                 self.last_touched = time.ticks_ms()
-                self.switch.value(not self.switch.value())
+                # FIXME: use pub/sub for touch event ?
+                #self.switch.value(not self.switch.value())
+            await uasyncio.sleep(self.poll)
+
+class TouchDimmer(TouchSwitch):
+    def __init__(self, touch:machine.TouchPad, pwm:machine.PWM):
+        self.touch = touch
+        self.pwm = pwm
+        self.last_reading = float('inf')
+        self.last_touched = 0
+        self.last_duty = 1023
+        self.threshold = 500
+        self.debounce = 500
+        self.step = 10
+        self.poll = 5/100
+
+    async def run_simpler(self):
+        while True:
+            touch = self.touch.read() < self.threshold
+            if touch and not self.touch:
+                self.touch = touch
+                # trigger touch in
+                print('Touch in')
+            if touch and self.touch:
+                # trigger touching
+                print('Touch touching')
+            if not touch and self.touch:
+                self.touch = touch
+                # trigger touch out
+                print('Touch out')
+
+    async def run(self):
+        while True:
+            reading = self.touch.read()
+            idle = time.ticks_ms() - self.last_touched  # idle < 0 when ticks_ms() value cycles
+            if reading > self.threshold:
+                if reading > self.last_reading:
+                    self.last_touched = time.ticks_ms()
+                if 0 <= idle < self.debounce:
+                    print('Switching on/off')
+                    self.pwm.duty(0 if self.duty() else self.last_duty)  # toggle on/off
+            else:
+                # if idle > self.debounce or age < 0:
+                print('Dimming')
+                self.pwm.duty((self.pwm.duty() + self.step) % 1023)
+                self.last_duty = self.pwm.duty()
+                self.last_reading = reading
             await uasyncio.sleep(self.poll)
 
 
 pins = {
     'smoke': machine.ADC(machine.Pin(34)),
     'temperature': machine.ADC(machine.Pin(36)),
-    'pir': machine.Pin(35, machine.Pin.IN),
-    'dht': dht.DHT22(machine.Pin(4)),
-    'switch': #[machine.PWM(machine.Pin(n)) for n in (5, 18, 19)]
-              [machine.Signal(machine.Pin(n, machine.Pin.OUT), invert=True) for n in (5, 18, 19)]
-             +[machine.Signal(machine.Pin(21, machine.Pin.OUT, machine.Pin.PULL_DOWN), invert=False)],
-    'touch': [machine.TouchPad(machine.Pin(n)) for n in (13, 12, 14)]}
+    'dht': dht.DHT22(machine.Pin(4))}
 pins['smoke'].atten(machine.ADC.ATTN_0DB)  # https://docs.micropython.org/en/latest/esp32/quickref.html#ADC.atten
 pins['temperature'].atten(machine.ADC.ATTN_11DB)  # https://docs.micropython.org/en/latest/esp32/quickref.html#ADC.atten
 
-presence = Presence(pins['pir'])
-touch = TouchSwitch(pins['touch'][index], pins['switch'][index])
+presence = Presence(35)#, timeout=10)
+switches = [TouchSwitch(n) for n in (13, 12, 14)] + [Switch()]
+onboard = Indicator(2)
+indicator = IndicatorRgb(5, 18, 19, invert=True)
 
-async def touch_handler(index):
-    await touch.run()
+async def switches_handler():
+    for button in switches:
+        uasyncio.get_event_loop().create_task(button.run())
+    while True:
+        # for color, switch in zip(indicator.colors.values(), switches):
+        for i in (0, 2):
+            color = list(indicator.colors.values())[i]
+            switch = switches[i]
+            color.to(switch.state)
+        await uasyncio.sleep(1/10)
 
 async def presence_handler():
-    uasyncio.get_event_loop().create_task(presence.run())
+    # uasyncio.get_event_loop().create_task(presence.run())
     while True:
-        pins['switch'][1].value(presence.detected)
-        await uasyncio.sleep(5/10)
+        presence.step()
+        ratio = 1 - presence.delta/presence.timeout if presence.detected else 0
+        indicator.to(g=ratio)
+        await uasyncio.sleep(1/10)
 
 async def smoke_handler():
     while True:
+        unhealthy = 0.7
+        danger = 0.9
         reading = smoke()
-        danger = reading > 0.7
-        print('Smoke', reading, danger)
-        pins['switch'][0].value(danger)
+        ratio = reading#(max(unhealthy, min(reading, danger)) - unhealthy) / 1/(danger-unhealthy)
+        print('Smoke', reading, ratio)
+        # indicator.to(r=ratio)
+        onboard.to(ratio)
         await uasyncio.sleep(1)
 
 async def network_handler():
@@ -211,27 +377,24 @@ def api_presence():
 
 @app.route('/switch/:id')
 def get_switch(id):
-    return 'ON' if pins['switch'][int(id)].value() else 'OFF'
+    return 'ON' if switches[int(id)].state else 'OFF'
 
 @app.route('/switch/')
 def get_switches():
-    return json.dumps({id: get_switch(id) for id in range(len(pins['switch']))})
+    return json.dumps({id: get_switch(id) for id in range(len(switches))})
 
 @app.route('/switch/:id', methods=['POST'])
 def set_switch(id):
-    pin = pins['switch'][int(id)]
+    switch = switches[int(id)]
     value = app.request.body
-    print('Setting %s to %s' % (pin, value))
-    pin.value(True if value.lower()=='on' else False)
+    log.info('Setting switch %s to %s' % (id, value))
+    switch.state = True if value.lower()=='on' else False
     return get_switch(id)
 
-
-# for switch in pins['switch']:
-#     switch.off()
+switches[2].state = True
 try:
     loop = uasyncio.get_event_loop()
-    for i in range(len(pins['touch'])):
-        loop.create_task(touch_handler(i))
+    loop.create_task(switches_handler())
     loop.create_task(presence_handler())
     loop.create_task(smoke_handler())
     loop.create_task(network_handler())
