@@ -1,2 +1,4 @@
 micropython-ulogging
 micropython-itertools
+micropython-urequests
+micropython-uasyncio

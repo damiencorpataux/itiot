@@ -234,7 +234,7 @@ then
     curl --progress-bar $FIRMWARE_URL > $FIRMWARE_TMP
     echo
     echo "+ Erasing MCU..."
-    esptool.py --chip esp32 erase_flash
+    esptool.py --chip auto erase_flash
     # from https://github.com/loboris/MicroPython_ESP32_psRAM_LoBo/blob/master/MicroPython_BUILD/firmware/flash.sh
     # esptool.py \
     #     --chip auto --port $DEVICE --baud $FLASHBAUD \
@@ -261,7 +261,7 @@ then
     # FIXME: should be factorized with command copy
     # FIXME: there should be only COPY
     # rshell  --timing --port $DEVICE mkdir $FLASH_PATH
-    rshell  --timing --port $DEVICE cp -r $DEPS_SOURCE $FLASH_PATH
+    rshell --nocolor --timing --port $DEVICE cp -r $DEPS_SOURCE $FLASH_PATH
     echo
 fi
 
@@ -270,27 +270,32 @@ then
     # FIXME: there should be only COPY
     BUILD_SOURCE=./itiot  # TODO: make this generic to any project PATH
     BUILD_PRODUCT=$BUILD_PATH/local
-    SIZE_SOURCE=$(du -sh $BUILD_SOURCE | xargs | cut -d' ' -f1)
     echo "* Uploading a build of local library to MCU $DEVICE"
-    echo "+ Building $SIZE_SOURCE to $BUILD_PRODUCT"
-    rm -rf $BUILD_PRODUCT
-    find $BUILD_SOURCE -type d -exec mkdir -p $BUILD_PRODUCT/{} \;
-    for file in $(find $BUILD_SOURCE -iname "*.py")
-    do
-        DESTINATION=$BUILD_PRODUCT/$file
-        cp $file $DESTINATION
-    done
-    # FIXME: sometimes it remove all file content, leaving just the pyminifier credits at the end...
-    # if [ "$2" != "raw" ]
-    # then
-    #   echo "+ Minifying..."
-    #   python3 -m pyminifier.pyminifier $DESTINATION > $DESTINATION
-    # fi
-    SIZE_PRODUCT=$(du -sh $BUILD_PRODUCT | xargs | cut -d' ' -f1)
-    echo "+ Uploading $SIZE_PRODUCT: $BUILD_SOURCE to MCU..."
-    echo
-    rshell --nocolor  --timing --port $DEVICE cp -r $BUILD_PRODUCT/* $FLASH_PATH/.
-    echo
+    if [ -e $BUILD_SOURCE ]
+    then
+        SIZE_SOURCE=$(du -sh $BUILD_SOURCE | xargs | cut -d' ' -f1)
+        echo "+ Building $SIZE_SOURCE to $BUILD_PRODUCT"
+        rm -rf $BUILD_PRODUCT
+        find $BUILD_SOURCE -type d -exec mkdir -p $BUILD_PRODUCT/{} \;
+        for file in $(find $BUILD_SOURCE -iname "*.py")
+        do
+            DESTINATION=$BUILD_PRODUCT/$file
+            cp $file $DESTINATION
+        done
+        # FIXME: sometimes it remove all file content, leaving just the pyminifier credits at the end...
+        # if [ "$2" != "raw" ]
+        # then
+        #   echo "+ Minifying..."
+        #   python3 -m pyminifier.pyminifier $DESTINATION > $DESTINATION
+        # fi
+        SIZE_PRODUCT=$(du -sh $BUILD_PRODUCT | xargs | cut -d' ' -f1)
+        echo "+ Uploading $SIZE_PRODUCT: $BUILD_SOURCE to MCU..."
+        echo
+        rshell --nocolor  --timing --port $DEVICE cp -r $BUILD_PRODUCT/* $FLASH_PATH/.
+        echo
+    else
+        echo "+ Skipping: '$BUILD_SOURCE' does not exist"
+    fi
 fi
 
 if [ $COPY ]
